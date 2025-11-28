@@ -42,7 +42,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # 全局缓存
 OBS_CACHE = {}
-MASK_CACHE = {} 
+MASK_CACHE = {}
 STATION_DF_CACHE = None
 
 # ---------------- 地图与掩膜辅助函数 ----------------
@@ -386,8 +386,56 @@ def fill_internal_gaps(data, lon, lat):
     
     data_filled = data.copy()
     data_filled[~valid_mask] = filled_vals
-    
+
     return data_filled
+
+# ---------------- 绘图前处理 ----------------
+
+def _prepare_plot_field(data, lon, lat, china_mask, upscale_factor=2):
+    """
+    让绘制的填色图紧贴地图边界、边界外留白，并在分辨率较低时进行平滑插值。
+
+    参数
+    ----
+    data : np.ndarray
+        原始待绘制数据（已为中国境外设为 NaN）。
+    lon, lat : np.ndarray
+        原始经纬度坐标（支持 1D 或 2D）。
+    china_mask : np.ndarray
+        中国境内为 True 的布尔掩膜。
+    upscale_factor : int
+        当原始网格较粗时，通过插值将分辨率提升的倍数。
+    """
+    if data is None:
+        return data, lon, lat
+
+    lon_2d, lat_2d = np.meshgrid(lon, lat) if lon.ndim == 1 else (lon, lat)
+    valid = np.isfinite(data)
+
+    # 如果数据点过少或无需放大，直接返回掩膜后的数据
+    if upscale_factor <= 1 or valid.sum() < 10:
+        masked = np.ma.masked_where(~china_mask | ~valid, data)
+        return masked, lon, lat
+
+    # 构建更细的经纬度网格
+    fine_lon = np.linspace(lon_2d.min(), lon_2d.max(), lon_2d.shape[1] * upscale_factor)
+    fine_lat = np.linspace(lat_2d.min(), lat_2d.max(), lat_2d.shape[0] * upscale_factor)
+    fine_lon_2d, fine_lat_2d = np.meshgrid(fine_lon, fine_lat)
+
+    # 仅使用有效点进行插值，先用 cubic 提升平滑度，不足部分退回 nearest 以避免空洞
+    points = np.column_stack((lon_2d[valid], lat_2d[valid]))
+    values = data[valid]
+    fine_field = griddata(points, values, (fine_lon_2d, fine_lat_2d), method='cubic')
+    fallback = griddata(points, values, (fine_lon_2d, fine_lat_2d), method='nearest')
+    fine_field = np.where(np.isfinite(fine_field), fine_field, fallback)
+
+    # 掩膜也插值到高分辨率网格，确保边界紧贴且外部留白
+    mask_points = np.column_stack((lon_2d.ravel(), lat_2d.ravel()))
+    fine_mask = griddata(mask_points, china_mask.ravel().astype(float),
+                         (fine_lon_2d, fine_lat_2d), method='nearest') > 0.5
+
+    masked = np.ma.masked_where(~fine_mask | ~np.isfinite(fine_field), fine_field)
+    return masked, fine_lon, fine_lat
 
 # ---------------- 绘图函数 ----------------
 
@@ -395,11 +443,11 @@ def save_plot(fig, path):
     fig.savefig(path, dpi=600, bbox_inches='tight')
     plt.close(fig)
 
-def plot_monthly_mean_triple(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, month_str):
+def plot_monthly_mean_triple(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, month_str, china_mask):
     china, nine = shapefiles[0], shapefiles[2]
     data_list = [aurora, obs, chap]
     titles = ['a: Aurora', 'b: Observed', 'c: CHAP']
-    
+
     # 计算Colorbar范围时忽略NaN
     valid_vals = np.concatenate([d[np.isfinite(d)] for d in data_list])
     if len(valid_vals) == 0: return # 避免空数据报错
@@ -409,13 +457,14 @@ def plot_monthly_mean_triple(aurora, obs, chap, lon, lat, var, save_dir, shapefi
 
     fig, axes = plt.subplots(1, 3, figsize=(20, 7), subplot_kw={'projection': ccrs.PlateCarree()})
     fig.subplots_adjust(left=0.03, right=0.97, bottom=0.15, top=0.90, wspace=0.1)
-    
+
     cs = None
     for ax, data, title in zip(axes, data_list, titles):
-        # 绘图（NaN会自动留白）
-        cs = ax.contourf(lon, lat, data, levels=levels, cmap='viridis', extend='both', transform=ccrs.PlateCarree())
+        masked_field, plot_lon, plot_lat = _prepare_plot_field(data, lon, lat, china_mask, upscale_factor=2)
+        cs = ax.contourf(plot_lon, plot_lat, masked_field, levels=levels, cmap='viridis', extend='both', transform=ccrs.PlateCarree())
         _setup_china_map(ax, ccrs.PlateCarree(), china, nine)
         ax.set_title(title, fontsize=14, fontweight='bold', pad=5)
+        ax.set_facecolor('white')
 
     cax_rect = _below_axes_colorbar_axes(fig, axes, width_scale=0.6, height=0.03, gap=0.05)
     cax = fig.add_axes(cax_rect)
@@ -427,7 +476,7 @@ def plot_monthly_mean_triple(aurora, obs, chap, lon, lat, var, save_dir, shapefi
 
     save_plot(fig, os.path.join(save_dir, f"{var}_{month_str}_Compare.png"))
 
-def plot_diff_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, month_str):
+def plot_diff_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, month_str, china_mask):
     china, nine = shapefiles[0], shapefiles[2]
     d1, d2 = aurora - obs, aurora - chap
     
@@ -442,9 +491,11 @@ def plot_diff_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, mont
     
     cs = None
     for ax, data, title in zip(axes, [d1, d2], ['Aurora - Observed', 'Aurora - CHAP']):
-        cs = ax.contourf(lon, lat, data, levels=levels, cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree())
+        masked_field, plot_lon, plot_lat = _prepare_plot_field(data, lon, lat, china_mask, upscale_factor=2)
+        cs = ax.contourf(plot_lon, plot_lat, masked_field, levels=levels, cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree())
         _setup_china_map(ax, ccrs.PlateCarree(), china, nine)
         ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_facecolor('white')
         
     cax_rect = _below_axes_colorbar_axes(fig, axes, width_scale=0.6, height=0.03)
     cax = fig.add_axes(cax_rect)
@@ -457,7 +508,7 @@ def plot_diff_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, mont
         
     save_plot(fig, os.path.join(save_dir, f"{var}_{month_str}_Diff.png"))
 
-def plot_rmse_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, month_str):
+def plot_rmse_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, month_str, china_mask):
     china, nine = shapefiles[0], shapefiles[2]
     # 计算绝对误差
     e1, e2 = np.abs(aurora - obs), np.abs(aurora - chap)
@@ -474,9 +525,11 @@ def plot_rmse_pairs(aurora, obs, chap, lon, lat, var, save_dir, shapefiles, mont
     cs = None
     for ax, data, title in zip(axes, [e1, e2], ['|Aurora - Observed|', '|Aurora - CHAP|']):
         # 色标两端显示倒三角（上下/左右方向的三角形扩展），需将 extend 设置为 'both'
-        cs = ax.contourf(lon, lat, data, levels=levels, cmap='inferno_r', extend='both', transform=ccrs.PlateCarree())
+        masked_field, plot_lon, plot_lat = _prepare_plot_field(data, lon, lat, china_mask, upscale_factor=2)
+        cs = ax.contourf(plot_lon, plot_lat, masked_field, levels=levels, cmap='inferno_r', extend='both', transform=ccrs.PlateCarree())
         _setup_china_map(ax, ccrs.PlateCarree(), china, nine)
         ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_facecolor('white')
         
     cax_rect = _below_axes_colorbar_axes(fig, axes, width_scale=0.6, height=0.03)
     cax = fig.add_axes(cax_rect)
@@ -568,15 +621,15 @@ def main():
             m_grid[~china_mask] = np.nan
             o_grid[~china_mask] = np.nan
             c_grid[~china_mask] = np.nan
-            
+
             # ------------------------------------------------
 
             out_path = os.path.join(OUT_DIR, m)
             os.makedirs(out_path, exist_ok=True)
 
-            plot_monthly_mean_triple(m_grid, o_grid, c_grid, lon, lat, var, out_path, china_shps, m)
-            plot_diff_pairs(m_grid, o_grid, c_grid, lon, lat, var, out_path, china_shps, m)
-            plot_rmse_pairs(m_grid, o_grid, c_grid, lon, lat, var, out_path, china_shps, m)
+            plot_monthly_mean_triple(m_grid, o_grid, c_grid, lon, lat, var, out_path, china_shps, m, china_mask)
+            plot_diff_pairs(m_grid, o_grid, c_grid, lon, lat, var, out_path, china_shps, m, china_mask)
+            plot_rmse_pairs(m_grid, o_grid, c_grid, lon, lat, var, out_path, china_shps, m, china_mask)
             
             del obs_df, obs_grid, chap_grid, m_grid, o_grid, c_grid
             gc.collect()
